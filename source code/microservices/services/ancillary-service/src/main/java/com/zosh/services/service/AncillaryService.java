@@ -1,0 +1,20 @@
+package com.zosh.services.service;
+
+import com.zosh.common_lib.exception.ResourceNotFoundException;
+import com.zosh.common_lib.payload.request.AncillaryRequest;
+import com.zosh.common_lib.payload.response.AncillaryResponse;
+
+import java.util.List;
+
+public interface AncillaryService {
+
+    AncillaryResponse create(Long userId, AncillaryRequest request) throws ResourceNotFoundException;
+
+    AncillaryResponse getById(Long id) throws ResourceNotFoundException;
+
+    List<AncillaryResponse> getAllByAirlineId(Long userId);
+
+    AncillaryResponse update(Long id, AncillaryRequest request) throws ResourceNotFoundException;
+
+    void delete(Long id);
+}
