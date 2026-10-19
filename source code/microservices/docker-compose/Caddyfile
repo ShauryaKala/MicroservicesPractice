@@ -1,0 +1,15 @@
+# Serves the built React app and forwards API calls to the gateway (same address, so no CORS).
+:80 {
+	encode gzip
+	handle /api/* {
+		reverse_proxy api-gateway:5000
+	}
+	handle /auth/* {
+		reverse_proxy api-gateway:5000
+	}
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

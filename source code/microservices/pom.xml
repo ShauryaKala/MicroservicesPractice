@@ -138,6 +138,7 @@
                         <source>${java.version}</source>
                         <target>${java.version}</target>
                         <parameters>true</parameters>
+                        <proc>full</proc>
                     </configuration>
                 </plugin>
 

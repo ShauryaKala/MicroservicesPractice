@@ -1,0 +1,257 @@
+# =============================================================================
+# AWS / single-server version of docker-compose.yml
+# - ONE MySQL container holding all nine databases (saves ~3 GB of RAM)
+# - Caddy serves the built React app and forwards /api and /auth to the gateway,
+#   so the whole site is one address on port 80 (no CORS, works with any IP)
+# Start:  docker compose -f docker-compose.aws.yml up -d
+# Stop:   docker compose -f docker-compose.aws.yml stop   (never "down": it wipes the data)
+# =============================================================================
+
+x-java: &java
+  JAVA_TOOL_OPTIONS: "-Xms128m -Xmx320m -XX:+UseSerialGC"
+  SPRING_CONFIG_IMPORT: "optional:configserver:http://config-server:8888/"
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: "http://service-registry:8761/eureka/"
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    command: --performance-schema=OFF --innodb-buffer-pool-size=256M
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: gds-redis
+    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:4.1.1
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+
+  config-server:
+    image: "zoshilo/gds-config-server:1.0.0"
+    container_name: gds-config-server
+    environment:
+      SPRING_CLOUD_CONFIG_SERVER_GIT_URI: "https://github.com/developer407/gds-config"
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: "http://service-registry:8761/eureka/"
+      JAVA_TOOL_OPTIONS: "-Xms128m -Xmx256m -XX:+UseSerialGC"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  service-registry:
+    image: "zoshilo/gds-service-registry:1.0.0"
+    container_name: gds-eureka-server
+    depends_on:
+      config-server: {condition: service_healthy}
+    environment:
+      <<: *java
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  api-gateway:
+    image: "zoshilo/gds-api-gateway:1.0.0"
+    container_name: gds-api-gateway
+    depends_on:
+      service-registry: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "api-gateway"
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+  user-service:
+    image: "zoshilo/gds-user:1.0.0"
+    container_name: gds-user-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "user-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_user?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+
+  airline-core-service:
+    image: "zoshilo/gds-airline:1.0.0"
+    container_name: gds-airline-core-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "airline-core-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_core_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+  flight-ops-service:
+    image: "zoshilo/gds-flight:1.0.0"
+    container_name: gds-flight-ops-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      kafka: {condition: service_started}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "flight-ops-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_flight_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+  location-service:
+    image: "zoshilo/gds-location:1.0.0"
+    container_name: gds-location-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "location-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_location_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+  seat-service:
+    image: "zoshilo/gds-seat:1.0.0"
+    container_name: gds-seat-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      kafka: {condition: service_started}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "seat-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_seat_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+  pricing-service:
+    image: "zoshilo/gds-pricing:1.0.0"
+    container_name: gds-pricing-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "pricing-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_pricing_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+  ancillary-service:
+    image: "zoshilo/gds-ancillary:1.0.0"
+    container_name: gds-ancillary-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "ancillary-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_ancillary_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+
+  booking-service:
+    image: "zoshilo/gds-booking:1.0.0"
+    container_name: gds-booking-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      kafka: {condition: service_started}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "booking-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_booking_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+  payment-service:
+    image: "zoshilo/gds-payment:1.0.0"
+    container_name: gds-payment-service
+    depends_on:
+      service-registry: {condition: service_healthy}
+      mysql: {condition: service_healthy}
+      kafka: {condition: service_started}
+    environment:
+      <<: *java
+      SPRING_APPLICATION_NAME: "payment-service"
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/airline_payment_db?useSSL=false&allowPublicKeyRetrieval=true"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Optional: Razorpay test keys, and where Razorpay sends travelers back after paying
+      # RAZORPAY_API_KEY: "rzp_test_..."
+      # RAZORPAY_API_SECRET: "..."
+      # RAZORPAY_CALLBACK_BASEURL: "http://YOUR-SERVER-IP"
+
+  web:
+    image: caddy:2
+    container_name: web
+    depends_on:
+      - api-gateway
+    ports:
+      - "80:80"            # the only public port
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../zosh-air-frontend/dist:/srv:ro
